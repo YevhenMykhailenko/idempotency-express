@@ -1,6 +1,6 @@
 {
   "name": "express-idempotency-middleware",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Express middleware for idempotent POSTs via Idempotency-Key with in-flight control and pluggable stores.",
   "type": "module",
   "main": "./dist/src/index.js",
@@ -32,7 +32,7 @@
     "webhooks",
     "payments"
   ],
-  "author": "Yevhen Mykhailenko" ,
+  "author": "Yevhen Mykhailenko",
   "license": "MIT",
   "repository": {
     "type": "git",
