@@ -1,25 +1,24 @@
 # express-idempotency-middleware
 
-[![npm version](https://img.shields.io/npm/v/express-idempotency-middleware.svg)](https://www.npmjs.com/package/express-idempotency-middleware)  
-[![CI](https://github.com/YevhenMykhailenko/idempotency-express/actions/workflows/ci.yml/badge.svg)](https://github.com/YevhenMykhailenko/idempotency-express/actions/workflows/ci.yml)
+[![npm version](https://img.shields.io/npm/v/express-idempotency-middleware.svg)](https://www.npmjs.com/package/express-idempotency-middleware)
 
-Express middleware that makes **unsafe** HTTP requests (mainly `POST`) **idempotent** using an `Idempotency-Key`.  
+Express middleware that makes **unsafe** HTTP requests (mainly `POST`) **idempotent** using an `Idempotency-Key`.
 The first request executes your handler and caches `{status, body, headers(whitelist)}` for a TTL. Identical retries return the cached response. Conflicting payloads get `409 Conflict`. Concurrency is handled via `wait` or `reject` strategies.
 
 ---
 
 ## Highlights
 
-- **Drop-in** per-route middleware  
-- **TypeScript-first**, ESM-only, Node ≥ 18  
-- Pluggable **stores**: built-in Memory (dev). Example Redis/Postgres stores in `examples/`  
-- **In-flight control**: `wait` (with timeout) or `reject`  
-- **Safe replay** with **header whitelist** (never replays cookies/auth)  
-- **Stable fingerprint**: method + path + normalized body + optional tenant/user  
+- **Drop-in** per-route middleware
+- **TypeScript-first**, ESM-only, Node ≥ 18
+- Pluggable **stores**: built-in Memory (dev). Example Redis/Postgres stores in `examples/`
+- **In-flight control**: `wait` (with timeout) or `reject`
+- **Safe replay** with **header whitelist** (never replays cookies/auth)
+- **Stable fingerprint**: method + path + normalized body + optional tenant/user
 - Designed for payments, orders, webhooks, and similar at-least-once scenarios
 
 ---
-
+   L
 ## Install
 
 ```bash
@@ -103,10 +102,10 @@ curl -i -X POST http://localhost:3000/payments   -H "Content-Type: application/j
 
 **Expected:**
 
-- `HTTP/1.1 201 Created` (same status as the first response)  
-- `Idempotency-Status: cached`  
-- `Idempotency-Replayed: true`  
-- `Content-Type: application/json; charset=utf-8`  
+- `HTTP/1.1 201 Created` (same status as the first response)
+- `Idempotency-Status: cached`
+- `Idempotency-Replayed: true`
+- `Content-Type: application/json; charset=utf-8`
 - Body: **identical** to the first response (same `orderId`)
 
 ### 3) Conflict — same key, different payload
@@ -122,11 +121,11 @@ curl -i -X POST http://localhost:3000/payments   -H "Content-Type: application/j
 
 ### 4) In-flight duplicates (concurrency)
 
-The example route simulates ~300 ms of work and uses `inFlight: { strategy: "wait", waitTimeoutMs: 3000 }`.  
-Open two terminals and run the same request with the same key as fast as possible.  
+The example route simulates ~300 ms of work and uses `inFlight: { strategy: "wait", waitTimeoutMs: 3000 }`.
+Open two terminals and run the same request with the same key as fast as possible.
 The second request will **wait** and return the cached result:
 
-- `Idempotency-Status: cached`  
+- `Idempotency-Status: cached`
 - `Idempotency-Replayed: true`
 
 ---
@@ -188,18 +187,18 @@ export interface Store {
 ## Behavior & Headers
 
 - Adds response headers:
-  - `Idempotency-Key`: echoes the key  
-  - `Idempotency-Status`: `created | cached | conflict | inflight | inflight-timeout | missing-key`  
-  - `Idempotency-Replayed`: `true | false`  
+  - `Idempotency-Key`: echoes the key
+  - `Idempotency-Status`: `created | cached | conflict | inflight | inflight-timeout | missing-key`
+  - `Idempotency-Replayed`: `true | false`
   - On in-flight timeout or reject: `Retry-After: 1`
-- **Replay headers**: only those in `replay.headerWhitelist` are replayed, plus `content-type` is always replayed.  
+- **Replay headers**: only those in `replay.headerWhitelist` are replayed, plus `content-type` is always replayed.
   Sensitive headers (`set-cookie`, `authorization`, `www-authenticate`, `proxy-*`) are **never** replayed.
 
 ---
 
 ## Using Redis / Postgres (examples)
 
-`Redis` and `Postgres` stores are provided as **examples** (no hard deps).  
+`Redis` and `Postgres` stores are provided as **examples** (no hard deps).
 See `examples/redis-store.ts` and `examples/postgres-store.ts` for sketches.
 
 **Typical approach (Redis sketch):**
@@ -252,18 +251,18 @@ CREATE INDEX ON idem_keys (expiry);
 
 ## Best Practices
 
-- Generate the key **client-side** (UUID v4) per unsafe request  
-- Fingerprint only what’s necessary (method, path, normalized body, tenant/user)  
-- Use a **centralized store** (Redis/PG) in production; MemoryStore is for dev/tests  
-- Whitelist only **safe headers** to replay (e.g., `location`); `content-type` is always replayed  
-- Keep TTL short (hours, not days). Consider background cleanup for SQL stores  
+- Generate the key **client-side** (UUID v4) per unsafe request
+- Fingerprint only what’s necessary (method, path, normalized body, tenant/user)
+- Use a **centralized store** (Redis/PG) in production; MemoryStore is for dev/tests
+- Whitelist only **safe headers** to replay (e.g., `location`); `content-type` is always replayed
+- Keep TTL short (hours, not days). Consider background cleanup for SQL stores
 - For webhooks, prefer provider event IDs (e.g., Stripe `event.id`) as the idempotency key
 
 ---
 
 ## Limitations
 
-- Not designed for streaming responses or long-running jobs  
+- Not designed for streaming responses or long-running jobs
   For multi-minute operations, prefer queues/outbox + status resources
 - MemoryStore is single-process only and volatile; use Redis/PG in production
 
@@ -271,13 +270,13 @@ CREATE INDEX ON idem_keys (expiry);
 
 ## Troubleshooting
 
-- **`ERR_MODULE_NOT_FOUND` after build**  
+- **`ERR_MODULE_NOT_FOUND` after build**
   Ensure compiled imports include explicit `.js` extensions and your `package.json` `exports` point to `./dist/src/index.js`.
 
-- **Second request shows `created` instead of `cached`**  
+- **Second request shows `created` instead of `cached`**
   Ensure you’re on a version where the MemoryStore uses a sane fallback TTL and the middleware commits on `finish`.
 
-- **`r2.body` is `{}` or a JSON string in tests**  
+- **`r2.body` is `{}` or a JSON string in tests**
   Make sure `Content-Type: application/json` is set and that replay includes `content-type` (the middleware always replays it by default).
 
 ---
