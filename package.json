@@ -1,0 +1,63 @@
+{
+  "name": "express-idempotency-middleware",
+  "version": "1.0.0",
+  "description": "Express middleware for idempotent POSTs via Idempotency-Key with in-flight control and pluggable stores.",
+  "type": "module",
+  "main": "./dist/src/index.js",
+  "module": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "default": "./dist/src/index.js"
+    }
+  },
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "keywords": [
+    "express",
+    "middleware",
+    "idempotency",
+    "idempotent",
+    "api",
+    "webhooks",
+    "payments"
+  ],
+  "author": "Yevhen Mykhailenko" ,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YevhenMykhailenko/idempotency-express.git"
+  },
+  "bugs": {
+    "url": "https://github.com/YevhenMykhailenko/idempotency-express/issues"
+  },
+  "homepage": "https://github.com/YevhenMykhailenko/idempotency-express#readme",
+  "peerDependencies": {
+    "express": "^4.18.0 || ^5.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.0.0",
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "eslint": "^9.0.0",
+    "eslint-config-prettier": "^9.0.0",
+    "prettier": "^3.0.0",
+    "supertest": "^7.0.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.0.0"
+  }
+}
