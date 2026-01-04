@@ -18,7 +18,7 @@ The first request executes your handler and caches `{status, body, headers(white
 - Designed for payments, orders, webhooks, and similar at-least-once scenarios
 
 ---
-   L
+
 ## Install
 
 ```bash
