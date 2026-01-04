@@ -1,6 +1,6 @@
 {
   "name": "express-idempotency-middleware",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Express middleware for idempotent POSTs via Idempotency-Key with in-flight control and pluggable stores.",
   "type": "module",
   "main": "./dist/src/index.js",
