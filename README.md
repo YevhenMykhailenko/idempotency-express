@@ -3,7 +3,7 @@
 [![npm version](https://img.shields.io/npm/v/express-idempotency-middleware.svg)](https://www.npmjs.com/package/express-idempotency-middleware)
 
 Express middleware that makes **unsafe** HTTP requests (mainly `POST`) **idempotent** using an `Idempotency-Key`.
-The first request executes your handler and caches `{status, body, headers(whitelist)}` for a TTL. Identical retries return the cached response. Conflicting payloads get `409 Conflict`. Concurrency is handled via `wait` or `reject` strategies.
+The first request executes your handler and caches `{status, body, headers(whitelist)}` for a TTL. Identical retries return the cached response. Conflicting payloads get `409 Conflict`. Bodies above the fingerprint size limit get `413 Payload Too Large` before a key is claimed. Concurrency is handled via `wait` or `reject` strategies.
 
 ---
 
@@ -15,6 +15,7 @@ The first request executes your handler and caches `{status, body, headers(white
 - **In-flight control**: `wait` (with timeout) or `reject`
 - **Safe replay** with **header whitelist** (never replays cookies/auth)
 - **Stable fingerprint**: method + path + normalized body + optional tenant/user
+- **No partial fingerprints**: oversized bodies are rejected instead of being hashed only in part
 - Designed for payments, orders, webhooks, and similar at-least-once scenarios
 
 ---
@@ -150,7 +151,7 @@ export type IdemOptions = {
   };
   fingerprint?: {
     includeQuery?: boolean;      // default false
-    maxBodyBytes?: number;       // default 64KB
+    maxBodyBytes?: number;       // default 64KB; larger bodies return 413
     custom?: (req: Request) => string | undefined; // e.g., tenant/user id
   };
   replay?: {
@@ -158,6 +159,8 @@ export type IdemOptions = {
   };
 };
 ```
+
+`maxBodyBytes` limits the UTF-8 byte length of the canonical body used for the fingerprint. JSON object keys are sorted, while string values and array order are preserved. Raw `Buffer` bodies are hashed as bytes. Object and array bodies must contain plain JSON data; unsupported JavaScript objects are passed to the Express error handler. If your parser accepts bodies above 64 KB, set `maxBodyBytes` high enough for them, or they will receive `413` and the key will remain unused. Keep a request body parser before this middleware so `req.body` contains the payload that your handler uses.
 
 ### Store Interface
 
@@ -172,15 +175,18 @@ export type CachedResponse = {
 
 export interface Store {
   begin(key: string, fp: string, ttlMs: number): Promise<
-    | { kind: "started" }
+    | { kind: "started"; reservationId?: string }
     | { kind: "replay"; cached: CachedResponse }
     | { kind: "conflict" }
     | { kind: "inflight" }
   >;
-  commit(key: string, data: CachedResponse): Promise<void>;
+  commit(key: string, data: CachedResponse, reservationId?: string): Promise<void>;
   get(key: string): Promise<CachedResponse | null>;
+  abort?(key: string, fp?: string, reservationId?: string): Promise<void>;
 }
 ```
+
+`begin` must atomically claim a key. If it returns a `reservationId`, `commit` and `abort` receive that ID so an expired request cannot modify a newer reservation. The built-in `MemoryStore` uses this safeguard. Custom stores should implement the same compare-and-set behavior and preserve the TTL. Set the TTL longer than the maximum handler duration; an expired in-flight reservation can allow a second execution.
 
 ---
 
@@ -188,43 +194,25 @@ export interface Store {
 
 - Adds response headers:
   - `Idempotency-Key`: echoes the key
-  - `Idempotency-Status`: `created | cached | conflict | inflight | inflight-timeout | missing-key`
+  - `Idempotency-Status`: `created | cached | conflict | inflight | inflight-timeout | missing-key | too-large | unparsed-body`
   - `Idempotency-Replayed`: `true | false`
   - On in-flight timeout or reject: `Retry-After: 1`
 - **Replay headers**: only those in `replay.headerWhitelist` are replayed, plus `content-type` is always replayed.
-  Sensitive headers (`set-cookie`, `authorization`, `www-authenticate`, `proxy-*`) are **never** replayed.
+  Authentication, cookie, hop-by-hop, and `content-encoding` headers are **never** replayed, even if whitelisted.
+
+### Upgrading from 1.0.x
+
+Version 2 changes the fingerprint format to cover complete, unambiguous payloads. Existing entries in a persistent store have the old fingerprint and will return `409 Conflict` for the same key until their TTL expires. Keep old entries until they expire; deleting them early can allow duplicate operations. During rollout, route all instances sharing a store to the same major version so they agree on fingerprints. For a deployment without migration conflicts, stop new writes on 1.0.x, wait at least the longest active TTL and for in-flight handlers to finish, then switch all instances to version 2.
+
+Requests with canonical bodies above `maxBodyBytes` now receive `413` instead of being hashed only in part. Requests with a nonempty body that has not been parsed before this middleware receive `400`. Configurations with invalid TTL, wait settings, body limit, or key header now fail at startup. The Express peer range begins at 4.22.3 or 5.1.0. Custom `Store` implementations with the former two-argument `commit` and `abort` signatures remain type-compatible; version 2 may pass an optional reservation ID as an additional argument. Custom stores should check that ID before modifying an in-flight entry.
 
 ---
 
 ## Using Redis / Postgres (examples)
 
-`Redis` and `Postgres` stores are provided as **examples** (no hard deps).
-See `examples/redis-store.ts` and `examples/postgres-store.ts` for sketches.
+`Redis` and `Postgres` files under `examples/` are **nonfunctional sketches**, not production stores. Their methods throw until implemented. Both stores need an atomic claim, state and fingerprint checks, TTL preservation, and reservation ID checks for commit and abort.
 
-**Typical approach (Redis sketch):**
-```ts
-// requires: npm i redis
-// import { createClient } from "redis";
-// const client = createClient({ url: process.env.REDIS_URL });
-// await client.connect();
-
-import type { Store, CachedResponse } from "express-idempotency-middleware";
-
-class RedisStore implements Store {
-  async begin(key: string, fp: string, ttlMs: number) {
-    // Use SETNX + PX (or a Lua script) to atomically claim the key
-    // Return: {kind:"started"} | {kind:"replay", cached} | {kind:"conflict"} | {kind:"inflight"}
-    return { kind: "started" };
-  }
-  async commit(key: string, data: CachedResponse) {
-    // Persist final response (JSON + keep TTL)
-  }
-  async get(key: string) {
-    // Read cached response (if any)
-    return null;
-  }
-}
-```
+**Redis:** claim the key atomically with `SET ... NX PX` or a Lua script. Use compare-and-set logic that checks both the fingerprint and the reservation ID before changing an in-flight entry to done or deleting it.
 
 **Typical approach (Postgres sketch):**
 ```sql
@@ -243,6 +231,7 @@ CREATE INDEX ON idem_keys (expiry);
 ```
 ```ts
 // Use INSERT ... ON CONFLICT to claim/update atomically inside a transaction.
+// Restrict commit/abort to the matching reservation ID.
 ```
 
 > Keep TTL moderate (hours). Store only safe headers. Avoid caching 5xx responses.
@@ -252,7 +241,7 @@ CREATE INDEX ON idem_keys (expiry);
 ## Best Practices
 
 - Generate the key **client-side** (UUID v4) per unsafe request
-- Fingerprint only what’s necessary (method, path, normalized body, tenant/user)
+- Include every input that affects the operation in the fingerprint. By default query parameters and request headers are excluded; use `includeQuery: true` and `custom` when they matter.
 - Use a **centralized store** (Redis/PG) in production; MemoryStore is for dev/tests
 - Whitelist only **safe headers** to replay (e.g., `location`); `content-type` is always replayed
 - Keep TTL short (hours, not days). Consider background cleanup for SQL stores
@@ -274,7 +263,7 @@ CREATE INDEX ON idem_keys (expiry);
   Ensure compiled imports include explicit `.js` extensions and your `package.json` `exports` point to `./dist/src/index.js`.
 
 - **Second request shows `created` instead of `cached`**
-  Ensure you’re on a version where the MemoryStore uses a sane fallback TTL and the middleware commits on `finish`.
+  Check that both requests use the same store instance and the first response completed before the retry. A reservation that expires during a long handler can also allow a new execution; increase `ttlMs` or use a job/status workflow.
 
 - **`r2.body` is `{}` or a JSON string in tests**
   Make sure `Content-Type: application/json` is set and that replay includes `content-type` (the middleware always replays it by default).
@@ -282,6 +271,8 @@ CREATE INDEX ON idem_keys (expiry);
 ---
 
 ## Development (this repo)
+
+Development tools require Node 22.12 or newer; the published middleware supports Node 18 or newer.
 
 ```bash
 npm i

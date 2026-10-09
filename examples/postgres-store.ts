@@ -25,12 +25,13 @@ CREATE INDEX ON idem_keys (expiry);
 export class PostgresStoreExample implements Store {
   async begin(key: string, fp: string, ttlMs: number): Promise<BeginResult> {
     // Use INSERT ... ON CONFLICT with state machine semantics (in tx).
-    return { kind: "started" }; // Placeholder
+    throw new Error("PostgresStoreExample is a sketch, not an implementation");
   }
   async commit(key: string, data: CachedResponse): Promise<void> {
     // UPDATE row to state='done', store response, keep expiry
+    throw new Error("PostgresStoreExample is a sketch, not an implementation");
   }
   async get(key: string): Promise<CachedResponse | null> {
-    return null;
+    throw new Error("PostgresStoreExample is a sketch, not an implementation");
   }
 }

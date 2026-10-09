@@ -1,8 +1,9 @@
 import type { NextFunction, Request, Response, RequestHandler } from "express";
+import { validateHeaderName } from "node:http";
 
 import type { CachedResponse, IdemOptions } from "./types.js";
 import { captureResponse } from "./utils/capture-response.js";
-import { buildFingerprint } from "./utils/fingerprint.js";
+import { buildFingerprint, FingerprintBodyTooLargeError } from "./utils/fingerprint.js";
 import { filterHeaders, lowerCaseHeaders } from "./utils/headers.js";
 
 const DEFAULT_METHODS = ["POST"];
@@ -21,9 +22,32 @@ export function idempotencyMiddleware(options: IdemOptions): RequestHandler {
     replay,
   } = options;
 
+  if (!store || typeof store.get !== "function" || typeof store.begin !== "function" ||
+      typeof store.commit !== "function") {
+    throw new TypeError("A store with get, begin, and commit is required");
+  }
+  if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0) {
+    throw new RangeError("ttlMs must be a positive safe integer");
+  }
+  if (inFlight.strategy !== "reject" && inFlight.strategy !== "wait") {
+    throw new TypeError("inFlight.strategy must be reject or wait");
+  }
+  if (inFlight.strategy === "wait") {
+    const pollMs = inFlight.pollMs ?? 100;
+    const waitTimeoutMs = inFlight.waitTimeoutMs ?? 5000;
+    if (!Number.isSafeInteger(pollMs) || pollMs <= 0 ||
+        !Number.isSafeInteger(waitTimeoutMs) || waitTimeoutMs <= 0) {
+      throw new RangeError("inFlight pollMs and waitTimeoutMs must be positive safe integers");
+    }
+  }
+  if (fingerprint?.maxBodyBytes !== undefined &&
+      (!Number.isSafeInteger(fingerprint.maxBodyBytes) || fingerprint.maxBodyBytes < 0)) {
+    throw new RangeError("maxBodyBytes must be a non-negative safe integer");
+  }
+  validateHeaderName(keyHeader);
+
   const wl = (replay?.headerWhitelist ?? []).map((h) => h.toLowerCase());
   const methodSet = new Set(methods.map((m) => m.toUpperCase()));
-  const inFlightLocal = new Map<string, string>(); // key -> fp
 
   return async function handler(req: Request, res: Response, next: NextFunction) {
     try {
@@ -44,52 +68,27 @@ export function idempotencyMiddleware(options: IdemOptions): RequestHandler {
         return next();
       }
 
-      const fp = buildFingerprint(req, fingerprint);
-
-      const local = inFlightLocal.get(key);
-      if (local) {
+      if (req.body === undefined &&
+          (Number(req.headers["content-length"] ?? 0) > 0 || req.headers["transfer-encoding"])) {
         res.setHeader("Idempotency-Key", key);
-        if (local !== fp) {
-          res.setHeader("Idempotency-Status", "conflict");
-          res.setHeader("Idempotency-Replayed", "false");
-          return res.status(409).json({ error: "Idempotency key conflict" });
-        }
-        if (inFlight.strategy === "reject") {
-          res.setHeader("Idempotency-Status", "inflight");
-          res.setHeader("Idempotency-Replayed", "false");
-          res.setHeader("Retry-After", "1");
-          return res.status(409).json({ error: "Request in-flight, retry later" });
-        } else {
-          const pollMs = inFlight.pollMs ?? 100;
-          const timeout = inFlight.waitTimeoutMs ?? 5000;
-          const start = Date.now();
-          while (Date.now() - start < timeout) {
-            const cached = await store.get(key);
-            if (cached) {
-              if (cached.fingerprint !== fp) {
-                res.setHeader("Idempotency-Status", "conflict");
-                res.setHeader("Idempotency-Replayed", "false");
-                return res.status(409).json({ error: "Idempotency key conflict" });
-              }
-              res.setHeader("Idempotency-Status", "cached");
-              res.setHeader("Idempotency-Replayed", "true");
-              res.setHeader("Idempotency-Key", key);
-              sendCached(res, cached, wl);
-              return;
-            }
-            await sleep(pollMs);
-          }
-          res.setHeader("Idempotency-Status", "inflight-timeout");
-          res.setHeader("Retry-After", "1");
-          return res.status(409).json({ error: "In-flight request timeout, retry later" });
-        }
+        res.setHeader("Idempotency-Status", "unparsed-body");
+        res.setHeader("Idempotency-Replayed", "false");
+        return res.status(400).json({ error: "Parse the request body before idempotency middleware" });
       }
 
-      inFlightLocal.set(key, fp);
+      let fp: string;
+      try {
+        fp = buildFingerprint(req, fingerprint);
+      } catch (err) {
+        if (!(err instanceof FingerprintBodyTooLargeError)) throw err;
+        res.setHeader("Idempotency-Key", key);
+        res.setHeader("Idempotency-Status", "too-large");
+        res.setHeader("Idempotency-Replayed", "false");
+        return res.status(413).json({ error: "Request body exceeds maxBodyBytes" });
+      }
 
       const existing = await store.get(key);
       if (existing) {
-        inFlightLocal.delete(key);
         res.setHeader("Idempotency-Key", key);
         if (existing.fingerprint === fp) {
           res.setHeader("Idempotency-Status", "cached");
@@ -107,7 +106,6 @@ export function idempotencyMiddleware(options: IdemOptions): RequestHandler {
       res.setHeader("Idempotency-Key", key);
 
       if (begin.kind === "replay") {
-        inFlightLocal.delete(key);
         if (begin.cached.fingerprint !== fp) {
           res.setHeader("Idempotency-Status", "conflict");
           res.setHeader("Idempotency-Replayed", "false");
@@ -120,14 +118,12 @@ export function idempotencyMiddleware(options: IdemOptions): RequestHandler {
       }
 
       if (begin.kind === "conflict") {
-        inFlightLocal.delete(key);
         res.setHeader("Idempotency-Status", "conflict");
         res.setHeader("Idempotency-Replayed", "false");
         return res.status(409).json({ error: "Idempotency key conflict" });
       }
 
       if (begin.kind === "inflight") {
-        inFlightLocal.delete(key);
         if (inFlight.strategy === "reject") {
           res.setHeader("Idempotency-Status", "inflight");
           res.setHeader("Idempotency-Replayed", "false");
@@ -173,7 +169,7 @@ export function idempotencyMiddleware(options: IdemOptions): RequestHandler {
             createdAt: Date.now(),
           };
           try {
-            await store.commit(key, cached);
+            await store.commit(key, cached, begin.reservationId);
           } catch {
             /* ignore */
           }
@@ -181,36 +177,16 @@ export function idempotencyMiddleware(options: IdemOptions): RequestHandler {
       });
 
       res.once("finish", async () => {
-        inFlightLocal.delete(key);
-
-        const body = cap.getBody();
+        cap.restore();
         const status = res.statusCode || 200;
 
-        if (status >= 500) {
+        if (status < 200 || status >= 500) {
           try {
-            await store.abort?.(key, fp);
+            await store.abort?.(key, fp, begin.reservationId);
           } catch {
             /* ignore */
           }
           return;
-        }
-
-        if (body && status >= 200 && status < 500) {
-          const headerMap = lowerCaseHeaders(
-            res.getHeaders() as Record<string, string | string[]>
-          );
-          const cached: CachedResponse = {
-            status,
-            body,
-            headers: headerMap,
-            fingerprint: fp,
-            createdAt: Date.now(),
-          };
-          try {
-            await store.commit(key, cached);
-          } catch {
-            /* ignore */
-          }
         }
       });
 
@@ -226,11 +202,11 @@ export function idempotencyMiddleware(options: IdemOptions): RequestHandler {
 function sendCached(res: Response, cached: CachedResponse, whitelist: string[]) {
   const headers = filterHeaders(cached.headers, whitelist);
   for (const [k, v] of Object.entries(headers)) {
-    if (k === "content-length") continue; // нехай Node перерахує
     res.setHeader(k, v as string | string[]);
   }
   res.status(cached.status);
-  return res.send(cached.body as string | Buffer);
+  if (cached.status === 204 || cached.status === 304) return res.end();
+  return res.end(cached.body);
 }
 
 function sleep(ms: number) {

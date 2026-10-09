@@ -3,65 +3,170 @@ import crypto from "node:crypto";
 
 import type { FingerprintOptions } from "../types.js";
 
+const DEFAULT_MAX_BODY_BYTES = 64 * 1024;
+
+export class FingerprintBodyTooLargeError extends Error {
+  constructor() {
+    super("Request body exceeds maxBodyBytes");
+    this.name = "FingerprintBodyTooLargeError";
+  }
+}
+
 export function buildFingerprint(req: Request, opts?: FingerprintOptions): string {
-  const includeQuery = !!opts?.includeQuery;
-  const maxBodyBytes = opts?.maxBodyBytes ?? 64 * 1024;
+  const maxBodyBytes = opts?.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
+  if (!Number.isSafeInteger(maxBodyBytes) || maxBodyBytes < 0) {
+    throw new RangeError("maxBodyBytes must be a non-negative safe integer");
+  }
 
   const method = (req.method || "GET").toUpperCase();
-  const pathOnly = (req.originalUrl || (req as Request).path || "/").split("?")[0] || "/";
-
-  const parts: string[] = [];
-  parts.push(method);
-  parts.push(pathOnly);
-
-  if (includeQuery) {
-    const raw = req.query as Record<string, unknown>;
-    const entries = Object.entries(raw || {}).map(([k, v]) => [k, String(v)]);
-    const sorted = entries.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-    parts.push(JSON.stringify(sorted));
-  }
-
+  const url = req.originalUrl || req.url || req.path || "/";
+  const queryStart = url.indexOf("?");
+  const pathOnly = (queryStart < 0 ? url : url.slice(0, queryStart)) || "/";
   const custom = opts?.custom?.(req);
-  if (custom) parts.push(custom);
+  if (custom != null && typeof custom !== "string") {
+    throw new TypeError("fingerprint.custom must return a string or undefined");
+  }
 
-  let bodyStr = "";
+  const hash = crypto.createHash("sha256");
+  // Each field has a byte length, so delimiters inside a path or custom value are harmless.
+  writeField(hash, "express-idempotency-middleware:2");
+  writeField(hash, method);
+  writeField(hash, pathOnly);
+  writeField(hash, opts?.includeQuery ? "query" : "no-query");
+  if (opts?.includeQuery) {
+    const queryHash = crypto.createHash("sha256");
+    writeCanonicalJson(
+      req.query || {},
+      (chunk) => { queryHash.update(chunk); },
+      new WeakSet<object>()
+    );
+    writeField(hash, queryHash.digest("hex"));
+  }
+  writeField(hash, custom == null ? "no-custom" : "custom");
+  if (custom != null) writeField(hash, custom);
+
   const body: unknown = (req as Request & { body?: unknown }).body;
-  if (body === undefined || body === null) {
-    bodyStr = "";
-  } else if (typeof body === "string") {
-    bodyStr = body;
-  } else if (Buffer.isBuffer(body)) {
-    bodyStr = body.toString("utf8");
-  } else if (typeof body === "object") {
-    bodyStr = stableStringify(body);
-  } else {
-    bodyStr = String(body);
-  }
-
-  if (bodyStr.length > maxBodyBytes) bodyStr = bodyStr.slice(0, maxBodyBytes);
-
-  const fpRaw = parts.join("|") + "|" + bodyStr;
-  return sha256(fpRaw);
-}
-
-function sha256(s: string): string {
-  return crypto.createHash("sha256").update(s).digest("hex");
-}
-
-function stableStringify(obj: unknown): string {
-  return JSON.stringify(sortDeep(obj));
-}
-
-function sortDeep(x: unknown): unknown {
-  if (Array.isArray(x)) return x.map(sortDeep);
-  if (x && typeof x === "object") {
-    const rec = x as Record<string, unknown>;
-    const out: Record<string, unknown> = {};
-    for (const k of Object.keys(rec).sort()) {
-      const v = rec[k];
-      out[k] = typeof v === "string" ? v.trim() : sortDeep(v);
+  let bodyBytes = 0;
+  const writeBody = (chunk: string | Buffer): void => {
+    const bytes = Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk);
+    if (bytes > maxBodyBytes - bodyBytes) throw new FingerprintBodyTooLargeError();
+    hash.update(chunk);
+    bodyBytes += bytes;
+  };
+  const checkStringSize = (value: string): void => {
+    // Escaping can only increase its encoded size; avoid serializing an oversized value.
+    if (Buffer.byteLength(value) > maxBodyBytes - bodyBytes) {
+      throw new FingerprintBodyTooLargeError();
     }
-    return out;
+  };
+
+  if (body === undefined) {
+    writeField(hash, "absent");
+  } else if (body === null) {
+    writeField(hash, "null");
+  } else if (Buffer.isBuffer(body)) {
+    writeField(hash, "buffer");
+    writeBody(body);
+  } else if (typeof body === "string") {
+    writeField(hash, "string");
+    checkStringSize(body);
+    writeBody(JSON.stringify(body));
+  } else if (typeof body === "object") {
+    writeField(hash, "json");
+    writeCanonicalJson(body, writeBody, new WeakSet<object>(), checkStringSize);
+  } else if (typeof body === "number" || typeof body === "boolean") {
+    if (typeof body === "number" && !Number.isFinite(body)) {
+      throw new TypeError("Request body is not JSON serializable");
+    }
+    writeField(hash, typeof body);
+    writeBody(Object.is(body, -0) ? "-0" : String(body));
+  } else {
+    throw new TypeError("Request body is not JSON serializable");
   }
-  return x;
+
+  return hash.digest("hex");
+}
+
+function writeField(hash: crypto.Hash, value: string): void {
+  const encoded = JSON.stringify(value);
+  hash.update(`${Buffer.byteLength(encoded)}:`);
+  hash.update(encoded);
+}
+
+function writeCanonicalJson(
+  value: unknown,
+  write: (chunk: string) => void,
+  seen: WeakSet<object>,
+  checkStringSize?: (value: string) => void
+): void {
+  if (value === null) {
+    write("null");
+  } else if (typeof value === "string") {
+    checkStringSize?.(value);
+    write(JSON.stringify(value));
+  } else if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new TypeError("Request body is not JSON serializable");
+    write(Object.is(value, -0) ? "-0" : JSON.stringify(value));
+  } else if (typeof value === "boolean") {
+    write(value ? "true" : "false");
+  } else if (Array.isArray(value)) {
+    if (Object.getPrototypeOf(value) !== Array.prototype) {
+      throw new TypeError("Request body is not a plain JSON array");
+    }
+    assertDataProperties(value, true);
+    if (seen.has(value)) throw new TypeError("Shared or circular request body");
+    seen.add(value);
+    write("[");
+    for (let i = 0; i < value.length; i++) {
+      if (i > 0) write(",");
+      if (!Object.hasOwn(value, i)) throw new TypeError("Request body is not JSON serializable");
+      const item: unknown = value[i];
+      if (item === undefined || typeof item === "function" || typeof item === "symbol") {
+        throw new TypeError("Request body is not JSON serializable");
+      } else {
+        writeCanonicalJson(item, write, seen, checkStringSize);
+      }
+    }
+    write("]");
+  } else if (typeof value === "object") {
+    const prototype: unknown = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new TypeError("Request body is not a plain JSON object");
+    }
+    assertDataProperties(value, false);
+    if (seen.has(value)) throw new TypeError("Shared or circular request body");
+    seen.add(value);
+    write("{");
+    const record = value as Record<string, unknown>;
+    let first = true;
+    for (const key of Object.keys(record).sort()) {
+      const item = record[key];
+      if (item === undefined || typeof item === "function" || typeof item === "symbol") {
+        throw new TypeError("Request body is not JSON serializable");
+      }
+      if (!first) write(",");
+      first = false;
+      checkStringSize?.(key);
+      write(JSON.stringify(key));
+      write(":");
+      writeCanonicalJson(item, write, seen, checkStringSize);
+    }
+    write("}");
+  } else {
+    throw new TypeError("Request body is not JSON serializable");
+  }
+}
+
+function assertDataProperties(value: object, isArray: boolean): void {
+  for (const key of Reflect.ownKeys(value)) {
+    if (isArray && key === "length") continue;
+    if (typeof key !== "string") throw new TypeError("Request body is not JSON serializable");
+    if (isArray && (!/^(0|[1-9]\d*)$/.test(key) || Number(key) >= (value as unknown[]).length)) {
+      throw new TypeError("Request body is not a plain JSON array");
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor?.enumerable || !("value" in descriptor)) {
+      throw new TypeError("Request body is not JSON serializable");
+    }
+  }
 }

@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run lint
+      - run: npm audit
+      - run: npm pack --dry-run
+
+  node18-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 18
+      - name: Check the published Node 18 runtime claim
+        run: |
+          node --input-type=module -e '
+            import { MemoryStore } from "./dist/src/index.js";
+            const store = new MemoryStore();
+            const started = await store.begin("key", "fp", 1000);
+            if (started.kind !== "started") process.exit(1);
+          '

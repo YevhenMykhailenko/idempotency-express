@@ -19,14 +19,15 @@ export class RedisStoreExample implements Store {
     //  - if 'inflight' with same fp -> inflight
     //  - if 'done' with same fp and not expired -> replay
     //  - else -> conflict
-    return { kind: "started" }; // Placeholder
+    throw new Error("RedisStoreExample is a sketch, not an implementation");
   }
 
   async commit(key: string, data: CachedResponse): Promise<void> {
     // Store as JSON and keep existing TTL
+    throw new Error("RedisStoreExample is a sketch, not an implementation");
   }
 
   async get(key: string): Promise<CachedResponse | null> {
-    return null;
+    throw new Error("RedisStoreExample is a sketch, not an implementation");
   }
 }

@@ -59,7 +59,7 @@ describe("MemoryStore TTL and expiry", () => {
     expect(r.kind).toBe("conflict");
   });
 
-  it("fallback commit path (no inflight) persists with sane TTL (>= 60s)", async () => {
+  it("ignores a commit without an active reservation", async () => {
     const s = new MemoryStore();
     const key = "ttl-k3";
     const fp = "fp";
@@ -76,6 +76,49 @@ describe("MemoryStore TTL and expiry", () => {
 
     nowSpy.mockReturnValue(50_100);
     const r = await s.begin(key, fp, 1000);
-    expect(r.kind).toBe("replay");
+    expect(r.kind).toBe("started");
+  });
+
+  it("does not let an old commit overwrite a newer reservation", async () => {
+    const s = new MemoryStore();
+    const nowSpy = vi.spyOn(Date, "now");
+    nowSpy.mockReturnValue(1_000);
+    await s.begin("stale", "old", 100);
+
+    nowSpy.mockReturnValue(1_101);
+    await s.begin("stale", "new", 1_000);
+    await s.commit("stale", {
+      status: 201, body: "new response", headers: {}, fingerprint: "new", createdAt: 1_101
+    });
+    await s.commit("stale", {
+      status: 201, body: "old response", headers: {}, fingerprint: "old", createdAt: 1_000
+    });
+
+    expect((await s.get("stale"))?.body).toBe("new response");
+  });
+
+  it("does not let an expired request commit or abort a new reservation with the same fingerprint", async () => {
+    const s = new MemoryStore();
+    const nowSpy = vi.spyOn(Date, "now");
+    nowSpy.mockReturnValue(1_000);
+    const old = await s.begin("same", "fp", 100);
+    expect(old.kind).toBe("started");
+    if (old.kind !== "started") return;
+
+    nowSpy.mockReturnValue(1_101);
+    const current = await s.begin("same", "fp", 1_000);
+    expect(current.kind).toBe("started");
+    if (current.kind !== "started") return;
+
+    await s.commit("same", {
+      status: 201, body: "old", headers: {}, fingerprint: "fp", createdAt: 1_101
+    }, old.reservationId);
+    await s.abort("same", "fp", old.reservationId);
+    expect((await s.begin("same", "fp", 1_000)).kind).toBe("inflight");
+
+    await s.commit("same", {
+      status: 201, body: "new", headers: {}, fingerprint: "fp", createdAt: 1_101
+    }, current.reservationId);
+    expect((await s.get("same"))?.body).toBe("new");
   });
 });

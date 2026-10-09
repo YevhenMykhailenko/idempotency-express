@@ -3,60 +3,49 @@ import type { Response } from "express";
 import type { Captured } from "../types.js";
 
 export function captureResponse(res: Response): Captured {
-  const originalSend: Response["send"] =
-    (res.send.bind(res) as unknown) as Response["send"];
-  const originalJson: Response["json"] =
-    (res.json.bind(res) as unknown) as Response["json"];
+  type MutableResponse = {
+    write: (...args: unknown[]) => boolean;
+    end: (...args: unknown[]) => Response;
+  };
+  const mutable = res as unknown as MutableResponse;
+  const originalWrite = mutable.write.bind(res);
+  const originalEnd = mutable.end.bind(res);
 
-  let capturedBody: string | Buffer | undefined;
+  let streamed = false;
+  let capturedBody: Buffer | undefined;
   let onSend: ((status: number, body: string | Buffer) => void) | undefined;
 
-  type SendArg = Parameters<Response["send"]>[0];
-  type JsonArg = Parameters<Response["json"]>[0];
-
-  type MutableResponse = Response & {
-    send: (body?: SendArg) => Response;
-    json: (body?: JsonArg) => Response;
+  mutable.write = (...args: unknown[]): boolean => {
+    streamed = true;
+    return originalWrite(...args);
   };
-  const r = res as MutableResponse;
 
-  r.send = function wrappedSend(this: Response, body?: SendArg): Response {
-    let toCapture: string | Buffer;
-    if (body === undefined) {
-      toCapture = Buffer.from("");
-    } else if (Buffer.isBuffer(body)) {
-      toCapture = body;
-    } else if (typeof body === "string") {
-      toCapture = body;
-    } else {
-      toCapture = JSON.stringify(body);
+  mutable.end = (...args: unknown[]): Response => {
+    if (!streamed) {
+      capturedBody = endBody(args[0], args[1]);
+      if (capturedBody) onSend?.(res.statusCode || 200, capturedBody);
     }
-
-    capturedBody = toCapture;
-    const status = this.statusCode || 200;
-    onSend?.(status, toCapture);
-    return originalSend(body);
-  };
-
-  r.json = function wrappedJson(this: Response, body?: JsonArg): Response {
-    const toCapture = JSON.stringify(body === undefined ? null : body);
-    capturedBody = toCapture;
-    const status = this.statusCode || 200;
-    onSend?.(status, toCapture);
-    return originalJson(body);
+    return originalEnd(...args);
   };
 
   return {
     getBody: () => capturedBody,
     restore: () => {
-      (r as MutableResponse).send = originalSend;
-      (r as MutableResponse).json = originalJson;
+      mutable.write = originalWrite;
+      mutable.end = originalEnd;
     },
-    setOnSend: (cb: (status: number, body: string | Buffer) => void) => {
-      onSend = cb;
-    },
-    setOn: (cb: (status: number, body: string | Buffer) => void) => {
-      onSend = cb;
-    },
+    setOnSend: (cb) => { onSend = cb; },
+    setOn: (cb) => { onSend = cb; },
   };
+}
+
+function endBody(chunk: unknown, encoding: unknown): Buffer | undefined {
+  if (chunk === undefined || chunk === null || typeof chunk === "function") {
+    return Buffer.alloc(0);
+  }
+  if (typeof chunk === "string") {
+    return Buffer.from(chunk, typeof encoding === "string" ? encoding as BufferEncoding : "utf8");
+  }
+  if (chunk instanceof Uint8Array) return Buffer.from(chunk);
+  return undefined;
 }

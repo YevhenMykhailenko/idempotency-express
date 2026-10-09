@@ -1,5 +1,7 @@
 node_modules
 dist
 coverage
+audit
 .vscode
 .env
+.DS_Store

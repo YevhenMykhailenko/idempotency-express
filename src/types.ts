@@ -11,16 +11,16 @@ export type CachedResponse = {
 };
 
 export type BeginResult =
-  | { kind: "started" }
+  | { kind: "started"; reservationId?: string }
   | { kind: "replay"; cached: CachedResponse }
   | { kind: "conflict" }
   | { kind: "inflight" };
 
 export interface Store {
   begin(key: string, fp: string, ttlMs: number): Promise<BeginResult>;
-  commit(key: string, data: CachedResponse): Promise<void>;
+  commit(key: string, data: CachedResponse, reservationId?: string): Promise<void>;
   get(key: string): Promise<CachedResponse | null>;
-  abort?(key: string, fp?: string): Promise<void>;
+  abort?(key: string, fp?: string, reservationId?: string): Promise<void>;
 }
 
 export type InFlightOptions = {
@@ -31,7 +31,7 @@ export type InFlightOptions = {
 
 export type FingerprintOptions = {
   includeQuery?: boolean;          // default false
-  maxBodyBytes?: number;           // default 64KB
+  maxBodyBytes?: number;           // default 64KB; larger canonical bodies return 413
   custom?: (req: Request) => string | undefined;
 };
 

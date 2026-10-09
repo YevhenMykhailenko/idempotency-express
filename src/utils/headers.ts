@@ -19,12 +19,15 @@ export function filterHeaders(
   whitelist: string[]
 ): HeaderMap {
   const safe: HeaderMap = {};
-  const deny = new Set(["set-cookie", "authorization", "www-authenticate"]);
+  const deny = new Set([
+    "authorization", "connection", "content-encoding", "content-length",
+    "keep-alive", "proxy-authenticate", "proxy-authorization", "set-cookie",
+    "te", "trailer", "transfer-encoding", "upgrade", "www-authenticate",
+  ]);
   const wl = new Set(whitelist.map((x) => x.toLowerCase()));
 
   for (const [k, v] of Object.entries(all)) {
     const key = k.toLowerCase();
-    if (key === "content-length") continue; // нехай Node перерахує
     if (deny.has(key)) continue;
     if (key.startsWith("proxy-")) continue;
 
