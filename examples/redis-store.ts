@@ -1,33 +1,12 @@
-/**
- * Example Redis store (pseudo-implementation, requires 'redis' package).
- * Not exported from library to avoid hard dependency.
- */
-// import { createClient } from "redis";
-import type { Store, BeginResult, CachedResponse } from "../src/types.js";
+/** Working node-redis 5.x connection factory; the application owns the client lifecycle. */
+import { createClient } from "redis";
 
-/*
-const client = createClient({ url: process.env.REDIS_URL });
-await client.connect();
-*/
+import { RedisStore } from "../src/redis.js";
 
-export class RedisStoreExample implements Store {
-  // private client = client;
-
-  async begin(key: string, fp: string, ttlMs: number): Promise<BeginResult> {
-    // Use SETNX with PX=ttl, and store {state:'inflight', fp}
-    // On existing key:
-    //  - if 'inflight' with same fp -> inflight
-    //  - if 'done' with same fp and not expired -> replay
-    //  - else -> conflict
-    throw new Error("RedisStoreExample is a sketch, not an implementation");
-  }
-
-  async commit(key: string, data: CachedResponse): Promise<void> {
-    // Store as JSON and keep existing TTL
-    throw new Error("RedisStoreExample is a sketch, not an implementation");
-  }
-
-  async get(key: string): Promise<CachedResponse | null> {
-    throw new Error("RedisStoreExample is a sketch, not an implementation");
-  }
+export async function connectRedisStore(url: string) {
+  const client = createClient({ url, disableOfflineQueue: true });
+  // Install your application's safe connection diagnostics; do not log credentials.
+  client.on("error", () => { console.error("Redis connection error"); });
+  await client.connect();
+  return { store: new RedisStore({ client }), close: () => client.close() };
 }

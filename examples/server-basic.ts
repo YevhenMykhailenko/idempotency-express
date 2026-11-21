@@ -11,13 +11,14 @@ app.post(
   "/payments",
   idempotencyMiddleware({
     store,
+    namespace: "payments-demo",
+    scope: "public-demo", // Private APIs must use an authenticated/authorized user or tenant scope.
     ttlMs: 24 * 60 * 60 * 1000,
     keyHeader: "Idempotency-Key",
     inFlight: { strategy: "wait", waitTimeoutMs: 3000, pollMs: 100 },
     replay: { headerWhitelist: ["location"] },
     fingerprint: {
       includeQuery: false,
-      custom: (req) => (req.headers["x-tenant-id"] as string | undefined),
       maxBodyBytes: 64 * 1024
     }
   }),

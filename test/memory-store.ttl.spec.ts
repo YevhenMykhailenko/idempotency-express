@@ -1,124 +1,76 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 
 import { MemoryStore } from "../src/memory-store.js";
+import { FINGERPRINT, OTHER_FINGERPRINT, response, start } from "./helpers/store-contract.js";
+import { buildStorageKey } from "../src/v3/key.js";
 
-describe("MemoryStore TTL and expiry", () => {
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
+const key = buildStorageKey("public-ttl", "user", "key");
+
+describe("public MemoryStore TTL and expiry", () => {
+  afterEach(() => { vi.restoreAllMocks(); });
 
   it("replays within TTL and expires after TTL", async () => {
-    const s = new MemoryStore();
-    const key = "ttl-k1";
-    const fp = "fp1";
-    const ttl = 1000;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    const store = new MemoryStore();
+    const owner = await start(store, key, FINGERPRINT, 1_000);
 
-    const nowSpy = vi.spyOn(Date, "now");
-
-    nowSpy.mockReturnValue(1_000);
-    const b1 = await s.begin(key, fp, ttl);
-    expect(b1.kind).toBe("started");
-
-    await s.commit(key, {
-      status: 201,
-      body: JSON.stringify({ ok: true }),
-      headers: { "content-type": "application/json" },
-      fingerprint: fp,
-      createdAt: 1_000
-    });
-
-    nowSpy.mockReturnValue(1_500);
-    const b2 = await s.begin(key, fp, ttl);
-    expect(b2.kind).toBe("replay");
-
-    nowSpy.mockReturnValue(2_200);
-    const b3 = await s.begin(key, fp, ttl);
-    expect(b3.kind).toBe("started");
+    await store.commit(key, response(), owner.reservationId);
+    clock.mockReturnValue(1_500);
+    expect((await store.begin(key, FINGERPRINT, 1_000)).kind).toBe("replay");
+    clock.mockReturnValue(2_200);
+    expect((await store.begin(key, FINGERPRINT, 1_000)).kind).toBe("started");
   });
 
-  it("returns conflict for different fingerprint within TTL", async () => {
-    const s = new MemoryStore();
-    const key = "ttl-k2";
-    const fp1 = "A";
-    const fp2 = "B";
-    const ttl = 1000;
-    const nowSpy = vi.spyOn(Date, "now");
+  it("conflicts for another fingerprint within TTL", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(10_000);
+    const store = new MemoryStore();
+    const owner = await start(store, key, FINGERPRINT, 1_000);
 
-    nowSpy.mockReturnValue(10_000);
-    await s.begin(key, fp1, ttl);
-    await s.commit(key, {
-      status: 201,
-      body: "x",
-      headers: {},
-      fingerprint: fp1,
-      createdAt: 10_100
-    });
-
-    nowSpy.mockReturnValue(10_500);
-    const r = await s.begin(key, fp2, ttl);
-    expect(r.kind).toBe("conflict");
+    await store.commit(key, response(), owner.reservationId);
+    clock.mockReturnValue(10_500);
+    expect(await store.begin(key, OTHER_FINGERPRINT, 1_000)).toEqual({ kind: "conflict" });
   });
 
-  it("ignores a commit without an active reservation", async () => {
-    const s = new MemoryStore();
-    const key = "ttl-k3";
-    const fp = "fp";
-    const nowSpy = vi.spyOn(Date, "now");
+  it("does not create a completed record without an active reservation", async () => {
+    const store = new MemoryStore();
 
-    nowSpy.mockReturnValue(50_000);
-    await s.commit(key, {
-      status: 201,
-      body: "ok",
-      headers: {},
-      fingerprint: fp,
-      createdAt: 50_000
-    });
-
-    nowSpy.mockReturnValue(50_100);
-    const r = await s.begin(key, fp, 1000);
-    expect(r.kind).toBe("started");
+    expect(await store.commit(key, response(), "unknown-owner")).toEqual({ kind: "reservation-lost" });
+    expect((await store.begin(key, FINGERPRINT, 1_000)).kind).toBe("started");
   });
 
-  it("does not let an old commit overwrite a newer reservation", async () => {
-    const s = new MemoryStore();
-    const nowSpy = vi.spyOn(Date, "now");
-    nowSpy.mockReturnValue(1_000);
-    await s.begin("stale", "old", 100);
+  it("does not let an old commit overwrite a completed replacement", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    const store = new MemoryStore();
+    const old = await start(store, key, FINGERPRINT, 100);
 
-    nowSpy.mockReturnValue(1_101);
-    await s.begin("stale", "new", 1_000);
-    await s.commit("stale", {
-      status: 201, body: "new response", headers: {}, fingerprint: "new", createdAt: 1_101
-    });
-    await s.commit("stale", {
-      status: 201, body: "old response", headers: {}, fingerprint: "old", createdAt: 1_000
-    });
+    clock.mockReturnValue(1_101);
+    const current = await start(store, key, OTHER_FINGERPRINT, 1_000);
 
-    expect((await s.get("stale"))?.body).toBe("new response");
+    await store.commit(key, response({ fingerprint: OTHER_FINGERPRINT, body: Buffer.from("new") }), current.reservationId);
+    expect(await store.commit(key, response(), old.reservationId)).toEqual({ kind: "reservation-lost" });
+    const entry = await store.read(key);
+
+    if (entry?.kind !== "completed") throw new Error("Expected completed entry");
+
+    expect(entry.cached.body.toString()).toBe("new");
   });
 
-  it("does not let an expired request commit or abort a new reservation with the same fingerprint", async () => {
-    const s = new MemoryStore();
-    const nowSpy = vi.spyOn(Date, "now");
-    nowSpy.mockReturnValue(1_000);
-    const old = await s.begin("same", "fp", 100);
-    expect(old.kind).toBe("started");
-    if (old.kind !== "started") return;
+  it("does not let an expired owner modify a replacement with the same fingerprint", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    const store = new MemoryStore();
+    const old = await start(store, key, FINGERPRINT, 100);
 
-    nowSpy.mockReturnValue(1_101);
-    const current = await s.begin("same", "fp", 1_000);
-    expect(current.kind).toBe("started");
-    if (current.kind !== "started") return;
+    clock.mockReturnValue(1_101);
+    const current = await start(store, key, FINGERPRINT, 1_000);
 
-    await s.commit("same", {
-      status: 201, body: "old", headers: {}, fingerprint: "fp", createdAt: 1_101
-    }, old.reservationId);
-    await s.abort("same", "fp", old.reservationId);
-    expect((await s.begin("same", "fp", 1_000)).kind).toBe("inflight");
+    expect(await store.commit(key, response(), old.reservationId)).toEqual({ kind: "reservation-lost" });
+    expect("abort" in store).toBe(false);
+    expect((await store.read(key))?.reservationId).toBe(current.reservationId);
+    await store.commit(key, response({ body: Buffer.from("new") }), current.reservationId);
+    const entry = await store.read(key);
 
-    await s.commit("same", {
-      status: 201, body: "new", headers: {}, fingerprint: "fp", createdAt: 1_101
-    }, current.reservationId);
-    expect((await s.get("same"))?.body).toBe("new");
+    if (entry?.kind !== "completed") throw new Error("Expected completed entry");
+
+    expect(entry.cached.body.toString()).toBe("new");
   });
 });

@@ -14,6 +14,7 @@ export class FingerprintBodyTooLargeError extends Error {
 
 export function buildFingerprint(req: Request, opts?: FingerprintOptions): string {
   const maxBodyBytes = opts?.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
+
   if (!Number.isSafeInteger(maxBodyBytes) || maxBodyBytes < 0) {
     throw new RangeError("maxBodyBytes must be a non-negative safe integer");
   }
@@ -23,11 +24,13 @@ export function buildFingerprint(req: Request, opts?: FingerprintOptions): strin
   const queryStart = url.indexOf("?");
   const pathOnly = (queryStart < 0 ? url : url.slice(0, queryStart)) || "/";
   const custom = opts?.custom?.(req);
+
   if (custom != null && typeof custom !== "string") {
     throw new TypeError("fingerprint.custom must return a string or undefined");
   }
 
   const hash = crypto.createHash("sha256");
+
   // Each field has a byte length, so delimiters inside a path or custom value are harmless.
   writeField(hash, "express-idempotency-middleware:2");
   writeField(hash, method);
@@ -35,6 +38,7 @@ export function buildFingerprint(req: Request, opts?: FingerprintOptions): strin
   writeField(hash, opts?.includeQuery ? "query" : "no-query");
   if (opts?.includeQuery) {
     const queryHash = crypto.createHash("sha256");
+
     writeCanonicalJson(
       req.query || {},
       (chunk) => { queryHash.update(chunk); },
@@ -42,6 +46,7 @@ export function buildFingerprint(req: Request, opts?: FingerprintOptions): strin
     );
     writeField(hash, queryHash.digest("hex"));
   }
+
   writeField(hash, custom == null ? "no-custom" : "custom");
   if (custom != null) writeField(hash, custom);
 
@@ -49,10 +54,13 @@ export function buildFingerprint(req: Request, opts?: FingerprintOptions): strin
   let bodyBytes = 0;
   const writeBody = (chunk: string | Buffer): void => {
     const bytes = Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk);
+
     if (bytes > maxBodyBytes - bodyBytes) throw new FingerprintBodyTooLargeError();
+
     hash.update(chunk);
     bodyBytes += bytes;
   };
+
   const checkStringSize = (value: string): void => {
     // Escaping can only increase its encoded size; avoid serializing an oversized value.
     if (Buffer.byteLength(value) > maxBodyBytes - bodyBytes) {
@@ -78,6 +86,7 @@ export function buildFingerprint(req: Request, opts?: FingerprintOptions): strin
     if (typeof body === "number" && !Number.isFinite(body)) {
       throw new TypeError("Request body is not JSON serializable");
     }
+
     writeField(hash, typeof body);
     writeBody(Object.is(body, -0) ? "-0" : String(body));
   } else {
@@ -89,6 +98,7 @@ export function buildFingerprint(req: Request, opts?: FingerprintOptions): strin
 
 function writeField(hash: crypto.Hash, value: string): void {
   const encoded = JSON.stringify(value);
+
   hash.update(`${Buffer.byteLength(encoded)}:`);
   hash.update(encoded);
 }
@@ -106,6 +116,7 @@ function writeCanonicalJson(
     write(JSON.stringify(value));
   } else if (typeof value === "number") {
     if (!Number.isFinite(value)) throw new TypeError("Request body is not JSON serializable");
+
     write(Object.is(value, -0) ? "-0" : JSON.stringify(value));
   } else if (typeof value === "boolean") {
     write(value ? "true" : "false");
@@ -113,44 +124,58 @@ function writeCanonicalJson(
     if (Object.getPrototypeOf(value) !== Array.prototype) {
       throw new TypeError("Request body is not a plain JSON array");
     }
+
     assertDataProperties(value, true);
     if (seen.has(value)) throw new TypeError("Shared or circular request body");
+
     seen.add(value);
     write("[");
     for (let i = 0; i < value.length; i++) {
       if (i > 0) write(",");
+
       if (!Object.hasOwn(value, i)) throw new TypeError("Request body is not JSON serializable");
+
       const item: unknown = value[i];
+
       if (item === undefined || typeof item === "function" || typeof item === "symbol") {
         throw new TypeError("Request body is not JSON serializable");
       } else {
         writeCanonicalJson(item, write, seen, checkStringSize);
       }
     }
+
     write("]");
   } else if (typeof value === "object") {
     const prototype: unknown = Object.getPrototypeOf(value);
+
     if (prototype !== Object.prototype && prototype !== null) {
       throw new TypeError("Request body is not a plain JSON object");
     }
+
     assertDataProperties(value, false);
     if (seen.has(value)) throw new TypeError("Shared or circular request body");
+
     seen.add(value);
     write("{");
     const record = value as Record<string, unknown>;
     let first = true;
+
     for (const key of Object.keys(record).sort()) {
       const item = record[key];
+
       if (item === undefined || typeof item === "function" || typeof item === "symbol") {
         throw new TypeError("Request body is not JSON serializable");
       }
+
       if (!first) write(",");
+
       first = false;
       checkStringSize?.(key);
       write(JSON.stringify(key));
       write(":");
       writeCanonicalJson(item, write, seen, checkStringSize);
     }
+
     write("}");
   } else {
     throw new TypeError("Request body is not JSON serializable");
@@ -160,11 +185,15 @@ function writeCanonicalJson(
 function assertDataProperties(value: object, isArray: boolean): void {
   for (const key of Reflect.ownKeys(value)) {
     if (isArray && key === "length") continue;
+
     if (typeof key !== "string") throw new TypeError("Request body is not JSON serializable");
+
     if (isArray && (!/^(0|[1-9]\d*)$/.test(key) || Number(key) >= (value as unknown[]).length)) {
       throw new TypeError("Request body is not a plain JSON array");
     }
+
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
+
     if (!descriptor?.enumerable || !("value" in descriptor)) {
       throw new TypeError("Request body is not JSON serializable");
     }

@@ -13,6 +13,22 @@ jobs:
     strategy:
       matrix:
         node: [22, 24]
+        express: [4, 5]
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      REDIS_URL: redis://127.0.0.1:6379
+      REDIS_RESTART_TEST: "1"
+      IDEM_REQUIRE_REDIS: "1"
+      IDEM_EXPRESS_MAJORS: ${{ matrix.express }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -22,15 +38,47 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci
+      - name: Verify Express 5 with matching types in an isolated dependency sandbox
+        if: matrix.express == 5
+        env:
+          IDEM_MATRIX_FULL: "1"
+        run: npm run test:express
       - run: npm run build
+        if: matrix.express == 4
       - run: npm run typecheck
+        if: matrix.express == 4
       - run: npm test
-      - run: npm run lint
-      - run: npm audit
-      - run: npm pack --dry-run
+        if: matrix.express == 4
+      - run: npm run test:redis
+        if: matrix.express == 4
+      - run: npm run lint -- --max-warnings=0
+        if: matrix.express == 4
+      - run: npm run test:package
+        if: matrix.express == 4
+      - run: npm run test:docs
+        if: matrix.express == 4
 
-  node18-smoke:
+  legacy-runtime:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        runtime: ["18.0.0", "18", "20"]
+        express: [4, 5]
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      REDIS_URL: redis://127.0.0.1:6379
+      IDEM_REQUIRE_REDIS: "1"
+      IDEM_EXPRESS_MAJORS: ${{ matrix.express }}
+      IDEM_REDIS_CLIENT_VERSION: ${{ matrix.runtime == '18.0.0' && '5.11.0' || '5.12.2' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -41,14 +89,22 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
+      - name: Resolve legacy runtime binary without switching development tools off Node 22
+        run: |
+          RUNTIME_NODE=$(npm exec --yes --package=node@${{ matrix.runtime }} -- node -p 'process.execPath')
+          echo "IDEM_RUNTIME_NODE=$RUNTIME_NODE" >> "$GITHUB_ENV"
+      - run: npm run test:package
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v7
         with:
-          node-version: 18
-      - name: Check the published Node 18 runtime claim
-        run: |
-          node --input-type=module -e '
-            import { MemoryStore } from "./dist/src/index.js";
-            const store = new MemoryStore();
-            const started = await store.begin("key", "fp", 1000);
-            if (started.kind !== "started") process.exit(1);
-          '
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # Independent failing gate: findings must not hide functional/package test results.
+      - run: npm audit

@@ -2,27 +2,31 @@ import express from "express";
 import request from "supertest";
 import { describe, expect, it } from "vitest";
 
-import { idempotencyMiddleware, MemoryStore, type IdemOptions } from "../src/index.js";
+import { idempotencyMiddleware, MemoryStore, type CommitResult, type IdemOptions } from "../src/index.js";
+import { testHttpServer } from "./helpers/test-http-server.js";
 import { filterHeaders } from "../src/utils/headers.js";
 
 class CountingStore extends MemoryStore {
   commits = 0;
 
-  override async commit(key: string, data: Parameters<MemoryStore["commit"]>[1]): Promise<void> {
+  override async commit(key: string, data: Parameters<MemoryStore["commit"]>[1], reservationId: string): Promise<CommitResult> {
     this.commits += 1;
-    await super.commit(key, data);
+
+    return super.commit(key, data, reservationId);
   }
 }
 
 class FlakyReadStore extends MemoryStore {
   private failOnce = true;
 
-  override async get(key: string) {
+  override async begin(key: string, fingerprint: string, ttlMs: number) {
     if (this.failOnce) {
       this.failOnce = false;
+
       throw new Error("temporary store failure");
     }
-    return super.get(key);
+
+    return super.begin(key, fingerprint, ttlMs);
   }
 }
 
@@ -31,14 +35,18 @@ describe("middleware lifecycle regressions", () => {
     const app = express();
     const store = new MemoryStore();
     let calls = 0;
-    app.post("/empty", idempotencyMiddleware({ store }), (_req, res) => {
+
+    app.post("/empty", idempotencyMiddleware({ store, namespace: "audit-tests", scope: "public-test" }), (_req, res) => {
       calls += 1;
       res.status(204).end();
     });
 
-    await request(app).post("/empty").set("Idempotency-Key", "empty").expect(204);
-    const replay = await request(app).post("/empty")
+    const { server } = await testHttpServer(app);
+
+    await request(server).post("/empty").set("Idempotency-Key", "empty").expect(204);
+    const replay = await request(server).post("/empty")
       .set("Idempotency-Key", "empty").expect(204);
+
     expect(replay.headers["idempotency-status"]).toBe("cached");
     expect(replay.headers.etag).toBeUndefined();
     expect(calls).toBe(1);
@@ -48,15 +56,18 @@ describe("middleware lifecycle regressions", () => {
     const app = express();
     const store = new MemoryStore();
     let calls = 0;
-    app.post("/plain", idempotencyMiddleware({ store }), (_req, res) => {
+
+    app.post("/plain", idempotencyMiddleware({ store, namespace: "audit-tests", scope: "public-test" }), (_req, res) => {
       calls += 1;
       res.status(201).end("plain response");
     });
 
-    const first = await request(app).post("/plain")
+    const { server } = await testHttpServer(app);
+    const first = await request(server).post("/plain")
       .set("Idempotency-Key", "plain").expect(201);
-    const replay = await request(app).post("/plain")
+    const replay = await request(server).post("/plain")
       .set("Idempotency-Key", "plain").expect(201);
+
     expect(replay.text).toBe(first.text);
     expect(replay.headers["content-type"]).toBeUndefined();
     expect(replay.headers.etag).toBeUndefined();
@@ -66,28 +77,35 @@ describe("middleware lifecycle regressions", () => {
   it("commits a JSON response only once", async () => {
     const app = express();
     const store = new CountingStore();
-    app.post("/json", idempotencyMiddleware({ store }), (_req, res) => {
+
+    app.post("/json", idempotencyMiddleware({ store, namespace: "audit-tests", scope: "public-test" }), (_req, res) => {
       res.status(201).json({ ok: true });
     });
 
-    await request(app).post("/json").set("Idempotency-Key", "count").expect(201);
+    const { server } = await testHttpServer(app);
+
+    await request(server).post("/json").set("Idempotency-Key", "count").expect(201);
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(store.commits).toBe(1);
   });
 
-  it("does not leave a local key lock after a store read error", async () => {
+  it("does not leave a reservation after a store begin error before claim", async () => {
     const app = express();
     const store = new FlakyReadStore();
-    app.post("/flaky", idempotencyMiddleware({ store }), (_req, res) => {
+
+    app.post("/flaky", idempotencyMiddleware({ store, namespace: "audit-tests", scope: "public-test" }), (_req, res) => {
       res.status(201).json({ ok: true });
     });
     app.use((_err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
       res.status(503).json({ error: "store unavailable" });
     });
 
-    await request(app).post("/flaky").set("Idempotency-Key", "flaky").expect(503);
-    const retry = await request(app).post("/flaky")
+    const { server } = await testHttpServer(app);
+
+    await request(server).post("/flaky").set("Idempotency-Key", "flaky").expect(503);
+    const retry = await request(server).post("/flaky")
       .set("Idempotency-Key", "flaky").expect(201);
+
     expect(retry.headers["idempotency-status"]).toBe("created");
   });
 
@@ -101,8 +119,9 @@ describe("middleware lifecycle regressions", () => {
       { fingerprint: { maxBodyBytes: -1 } },
       { keyHeader: "Invalid Header" },
     ];
+
     for (const options of invalid) {
-      expect(() => idempotencyMiddleware({ store, ...options })).toThrow();
+      expect(() => idempotencyMiddleware({ store, namespace: "audit-tests", scope: "public-test", ...options } as IdemOptions)).toThrow();
     }
   });
 
@@ -115,6 +134,7 @@ describe("middleware lifecycle regressions", () => {
       "set-cookie": "session=secret",
       location: "/resource/1",
     };
+
     expect(filterHeaders(headers, Object.keys(headers))).toEqual({
       "content-type": "application/json",
       location: "/resource/1",
@@ -125,17 +145,21 @@ describe("middleware lifecycle regressions", () => {
     const app = express();
     const store = new MemoryStore();
     let calls = 0;
-    app.post("/late-parser", idempotencyMiddleware({ store }), express.json(), (_req, res) => {
+
+    app.post("/late-parser", idempotencyMiddleware({ store, namespace: "audit-tests", scope: "public-test" }), express.json(), (_req, res) => {
       calls += 1;
       res.status(201).json({ calls });
     });
 
-    const first = await request(app).post("/late-parser")
+    const { server } = await testHttpServer(app);
+    const first = await request(server).post("/late-parser")
       .set("Idempotency-Key", "late").send({ amount: 1 }).expect(400);
-    expect(first.headers["idempotency-status"]).toBe("unparsed-body");
-    const second = await request(app).post("/late-parser")
+
+    expect(first.body.error.code).toBe("idempotency_body_unparsed");
+    const second = await request(server).post("/late-parser")
       .set("Idempotency-Key", "late").send({ amount: 2 }).expect(400);
-    expect(second.headers["idempotency-status"]).toBe("unparsed-body");
+
+    expect(second.body.error.code).toBe("idempotency_body_unparsed");
     expect(calls).toBe(0);
   });
 });

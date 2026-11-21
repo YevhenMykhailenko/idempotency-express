@@ -1,5 +1,6 @@
 export { idempotencyMiddleware } from "./middleware.js";
 export { MemoryStore } from "./memory-store.js";
+export { StoreCapacityError, StoreDataError } from "./v3/errors.js";
 export type {
   IdemOptions,
   Store,
@@ -9,5 +10,12 @@ export type {
   FingerprintOptions,
   ReplayOptions,
   BeginResult,
-  Captured,
+  CommitResult,
+  CompletedEntry,
+  InflightEntry,
+  Reservation,
+  StoreEntry,
+  MemoryStoreOptions,
+  KeyOptions,
+  IdempotencyEvent,
 } from "./types.js";

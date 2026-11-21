@@ -1,214 +1,262 @@
-import type { NextFunction, Request, Response, RequestHandler } from "express";
-import { validateHeaderName } from "node:http";
+import type { NextFunction, Request, RequestHandler, Response } from "express";
 
-import type { CachedResponse, IdemOptions } from "./types.js";
+import type { CachedResponse, IdemOptions, Reservation } from "./types.js";
 import { captureResponse } from "./utils/capture-response.js";
 import { buildFingerprint, FingerprintBodyTooLargeError } from "./utils/fingerprint.js";
-import { filterHeaders, lowerCaseHeaders } from "./utils/headers.js";
-
-const DEFAULT_METHODS = ["POST"];
-const DEFAULT_TTL = 24 * 60 * 60 * 1000; // 24h
-const DEFAULT_HEADER = "Idempotency-Key";
+import { filterHeaders } from "./utils/headers.js";
+import { DisconnectedError, monotonicNow, sleep, withDeadline } from "./v3/deadline.js";
+import { StoreCapacityError, StoreDataError } from "./v3/errors.js";
+import { HttpFailure, sendFailure, setIdempotencyHeaders } from "./v3/http-error.js";
+import { assertClientKey, assertScope, buildStorageKey } from "./v3/key.js";
+import { normalizeOptions } from "./v3/options.js";
+import { validateBegin, validateCommit, validateEntry } from "./v3/protocol.js";
 
 export function idempotencyMiddleware(options: IdemOptions): RequestHandler {
-  const {
-    store,
-    ttlMs = DEFAULT_TTL,
-    methods = DEFAULT_METHODS,
-    keyHeader = DEFAULT_HEADER,
-    requireKey = false,
-    inFlight = { strategy: "reject" },
-    fingerprint,
-    replay,
-  } = options;
+  const config = normalizeOptions(options);
+  const { store, emit } = config;
 
-  if (!store || typeof store.get !== "function" || typeof store.begin !== "function" ||
-      typeof store.commit !== "function") {
-    throw new TypeError("A store with get, begin, and commit is required");
-  }
-  if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0) {
-    throw new RangeError("ttlMs must be a positive safe integer");
-  }
-  if (inFlight.strategy !== "reject" && inFlight.strategy !== "wait") {
-    throw new TypeError("inFlight.strategy must be reject or wait");
-  }
-  if (inFlight.strategy === "wait") {
-    const pollMs = inFlight.pollMs ?? 100;
-    const waitTimeoutMs = inFlight.waitTimeoutMs ?? 5000;
-    if (!Number.isSafeInteger(pollMs) || pollMs <= 0 ||
-        !Number.isSafeInteger(waitTimeoutMs) || waitTimeoutMs <= 0) {
-      throw new RangeError("inFlight pollMs and waitTimeoutMs must be positive safe integers");
+  async function storeCall<T>(operation: "begin" | "read" | "commit", call: () => Promise<T>, budget = config.storeTimeoutMs, signal?: AbortSignal): Promise<T> {
+    const start = monotonicNow();
+
+    try { return await withDeadline(call, budget, signal); } catch (error) {
+      if (error instanceof DisconnectedError) throw error;
+
+      const reason = error instanceof StoreDataError ? "store_invalid"
+        : operation === "begin" && error instanceof StoreCapacityError ? "capacity_exceeded" : "store_unavailable";
+
+      emit({ type: "store-error", operation, code: `idempotency_${reason}`, durationMs: monotonicNow() - start });
+
+      throw new HttpFailure(reason);
     }
   }
-  if (fingerprint?.maxBodyBytes !== undefined &&
-      (!Number.isSafeInteger(fingerprint.maxBodyBytes) || fingerprint.maxBodyBytes < 0)) {
-    throw new RangeError("maxBodyBytes must be a non-negative safe integer");
+
+  function replay(res: Response, key: string, cached: CachedResponse): void {
+    if (res.destroyed || res.writableEnded) return;
+
+    if (res.headersSent) { res.destroy();
+
+      return; }
+
+    for (const name of ["content-length", "content-encoding", "etag", "location", "content-type"]) res.removeHeader(name);
+
+    for (const [name, value] of Object.entries(filterHeaders(cached.headers, config.whitelist))) res.setHeader(name, value);
+
+    res.statusCode = cached.status;
+    setIdempotencyHeaders(res, key, "cached");
+    res.end(cached.body);
+    emit({ type: "replayed", status: cached.status });
   }
-  validateHeaderName(keyHeader);
 
-  const wl = (replay?.headerWhitelist ?? []).map((h) => h.toLowerCase());
-  const methodSet = new Set(methods.map((m) => m.toUpperCase()));
+  async function wait(res: Response, key: string, storageKey: string, fingerprint: string, owner: Reservation): Promise<void> {
+    const controller = new AbortController();
+    const close = (): void => { controller.abort(); };
 
-  return async function handler(req: Request, res: Response, next: NextFunction) {
+    res.once("close", close);
+    const deadline = monotonicNow() + config.waitTimeoutMs;
+
     try {
-      if (!methodSet.has((req.method || "").toUpperCase())) return next();
+      while (!res.destroyed && !controller.signal.aborted) {
+        const remaining = deadline - monotonicNow();
 
-      const lower = keyHeader.toLowerCase();
-      const key =
-        (req.get(keyHeader) ??
-          req.get(lower) ??
-          (req.headers[lower] as string | undefined) ??
-          (req.headers[keyHeader] as string | undefined))?.toString();
+        if (remaining <= 0) throw new HttpFailure("wait_timeout");
 
-      if (!key) {
-        if (requireKey) {
-          res.setHeader("Idempotency-Status", "missing-key");
-          return res.status(400).json({ error: "Idempotency key is required" });
+        let entry;
+
+        try {
+          entry = await storeCall("read", async () => {
+            const value = await store.read(storageKey);
+
+            return value === null ? null : validateEntry(value);
+          }, Math.min(config.storeTimeoutMs, remaining), controller.signal);
+        } catch (error) {
+          if (error instanceof DisconnectedError) return;
+
+          if (monotonicNow() >= deadline) throw new HttpFailure("wait_timeout");
+
+          throw error;
         }
-        return next();
-      }
 
-      if (req.body === undefined &&
-          (Number(req.headers["content-length"] ?? 0) > 0 || req.headers["transfer-encoding"])) {
-        res.setHeader("Idempotency-Key", key);
-        res.setHeader("Idempotency-Status", "unparsed-body");
-        res.setHeader("Idempotency-Replayed", "false");
-        return res.status(400).json({ error: "Parse the request body before idempotency middleware" });
-      }
-
-      let fp: string;
-      try {
-        fp = buildFingerprint(req, fingerprint);
-      } catch (err) {
-        if (!(err instanceof FingerprintBodyTooLargeError)) throw err;
-        res.setHeader("Idempotency-Key", key);
-        res.setHeader("Idempotency-Status", "too-large");
-        res.setHeader("Idempotency-Replayed", "false");
-        return res.status(413).json({ error: "Request body exceeds maxBodyBytes" });
-      }
-
-      const existing = await store.get(key);
-      if (existing) {
-        res.setHeader("Idempotency-Key", key);
-        if (existing.fingerprint === fp) {
-          res.setHeader("Idempotency-Status", "cached");
-          res.setHeader("Idempotency-Replayed", "true");
-          sendCached(res, existing, wl);
-          return;
-        } else {
-          res.setHeader("Idempotency-Status", "conflict");
-          res.setHeader("Idempotency-Replayed", "false");
-          return res.status(409).json({ error: "Idempotency key conflict" });
+        if (!entry || entry.reservationId !== owner.reservationId || entry.expiresAt !== owner.expiresAt) {
+          throw new HttpFailure("result_unknown");
         }
+
+        if (entry.fingerprint !== fingerprint) throw new HttpFailure("store_invalid");
+
+        if (entry.kind === "completed") { replay(res, key, entry.cached);
+
+          return; }
+
+        await sleep(Math.min(config.pollMs, Math.max(0, deadline - monotonicNow())), controller.signal);
       }
+    } catch (error) {
+      if (error instanceof DisconnectedError) return;
 
-      const begin = await store.begin(key, fp, ttlMs);
-      res.setHeader("Idempotency-Key", key);
+      if (error instanceof HttpFailure && error.reason === "wait_timeout") emit({ type: "wait-timeout", code: error.code });
 
-      if (begin.kind === "replay") {
-        if (begin.cached.fingerprint !== fp) {
-          res.setHeader("Idempotency-Status", "conflict");
-          res.setHeader("Idempotency-Replayed", "false");
-          return res.status(409).json({ error: "Idempotency key conflict" });
-        }
-        res.setHeader("Idempotency-Status", "cached");
-        res.setHeader("Idempotency-Replayed", "true");
-        sendCached(res, begin.cached, wl);
+      throw error;
+    } finally { res.removeListener("close", close); }
+  }
+
+  return async function handler(req: Request, res: Response, next: NextFunction): Promise<void> {
+    if (!config.methods.has(req.method.toUpperCase())) { next();
+
+      return; }
+
+    let key: string | undefined;
+    let captured: ReturnType<typeof captureResponse> | undefined;
+
+    try {
+      const extracted = extractKey(req);
+
+      if (extracted === undefined) {
+        if (config.requireKey) throw new HttpFailure("key_required");
+
+        emit({ type: "bypassed" });
+        next();
+
         return;
       }
 
-      if (begin.kind === "conflict") {
-        res.setHeader("Idempotency-Status", "conflict");
-        res.setHeader("Idempotency-Replayed", "false");
-        return res.status(409).json({ error: "Idempotency key conflict" });
+      try { assertClientKey(extracted); } catch { throw new HttpFailure("key_invalid"); }
+
+      key = extracted;
+      let scope: string;
+
+      try {
+        const value: unknown = typeof config.scope === "function" ? config.scope(req) : config.scope;
+
+        observeAsync(value);
+        assertScope(value);
+        scope = value;
+      } catch { throw new HttpFailure("scope_invalid"); }
+
+      if (req.body === undefined && (Number(req.headers["content-length"] ?? 0) > 0 || req.headers["transfer-encoding"])) {
+        throw new HttpFailure("body_unparsed");
       }
+
+      let fingerprint: string;
+
+      try {
+        const custom = config.fingerprint.custom;
+
+        fingerprint = buildFingerprint(req, { ...config.fingerprint, ...(custom ? { custom: (request: Request) => {
+          const value = custom(request);
+
+          observeAsync(value);
+
+          return value;
+        } } : {}) });
+      } catch (error) {
+        throw new HttpFailure(error instanceof FingerprintBodyTooLargeError ? "body_too_large" : "fingerprint_failed");
+      }
+
+      if (res.destroyed || res.writableEnded) return;
+
+      if (res.headersSent) { res.destroy();
+
+        return; }
+
+      const storageKey = buildStorageKey(config.namespace, scope, key);
+      const start = monotonicNow();
+      const begin = await storeCall("begin", async () => validateBegin(await store.begin(storageKey, fingerprint, config.ttlMs), fingerprint));
+
+      if (res.destroyed || res.writableEnded) return;
+
+      if (res.headersSent) { res.destroy();
+
+        return; }
+
+      if (begin.kind === "conflict") {
+        emit({ type: "conflict" });
+
+        throw new HttpFailure("conflict");
+      }
+
+      if (begin.kind === "replay") { replay(res, key, begin.entry.cached);
+
+        return; }
 
       if (begin.kind === "inflight") {
-        if (inFlight.strategy === "reject") {
-          res.setHeader("Idempotency-Status", "inflight");
-          res.setHeader("Idempotency-Replayed", "false");
-          res.setHeader("Retry-After", "1");
-          return res.status(409).json({ error: "Request in-flight, retry later" });
-        } else {
-          const pollMs = inFlight.pollMs ?? 100;
-          const timeout = inFlight.waitTimeoutMs ?? 5000;
-          const start = Date.now();
-          while (Date.now() - start < timeout) {
-            const cached = await store.get(key);
-            if (cached) {
-              if (cached.fingerprint !== fp) {
-                res.setHeader("Idempotency-Status", "conflict");
-                res.setHeader("Idempotency-Replayed", "false");
-                return res.status(409).json({ error: "Idempotency key conflict" });
-              }
-              res.setHeader("Idempotency-Status", "cached");
-              res.setHeader("Idempotency-Replayed", "true");
-              sendCached(res, cached, wl);
-              return;
-            }
-            await sleep(pollMs);
-          }
-          res.setHeader("Idempotency-Status", "inflight-timeout");
-          res.setHeader("Retry-After", "1");
-          return res.status(409).json({ error: "In-flight request timeout, retry later" });
-        }
+        emit({ type: "inflight" });
+        if (config.strategy === "reject") throw new HttpFailure("inflight");
+
+        await wait(res, key, storageKey, fingerprint, begin);
+
+        return;
       }
 
-      const cap = captureResponse(res);
+      if (monotonicNow() - start >= config.ttlMs) throw new HttpFailure("result_unknown");
 
-      cap.setOnSend(async (status: number, body: string | Buffer) => {
-        if (status >= 200 && status < 500) {
-          const headerMap = lowerCaseHeaders(
-            res.getHeaders() as Record<string, string | string[]>
-          );
-          const cached: CachedResponse = {
-            status,
-            body,
-            headers: headerMap,
-            fingerprint: fp,
-            createdAt: Date.now(),
-          };
+      captured = captureResponse(res, {
+        key, fingerprint, whitelist: config.whitelist, maxResponseBytes: config.maxResponseBytes,
+        commit: async (cached) => {
           try {
-            await store.commit(key, cached, begin.reservationId);
-          } catch {
-            /* ignore */
-          }
-        }
+            const result = await storeCall("commit", async () => validateCommit(
+              await store.commit(storageKey, cached, begin.reservationId), fingerprint, begin,
+            ));
+
+            if (result.kind === "reservation-lost") throw new HttpFailure("result_unknown");
+
+            const canonical = result.kind === "already-committed";
+            const response = result.kind === "already-committed" ? result.entry.cached : cached;
+
+            emit({ type: "completed", status: response.status });
+
+            return { cached: response, canonical };
+          } catch { throw new HttpFailure("result_unknown"); }
+        },
+        onFailure: (failure) => { emit({ type: "outcome-unknown", code: failure.code, status: failure.status }); },
       });
+      emit({ type: "started" });
+      const elapsed = monotonicNow() - start;
 
-      res.once("finish", async () => {
-        cap.restore();
-        const status = res.statusCode || 200;
+      if (elapsed >= config.storeTimeoutMs || elapsed >= config.ttlMs) {
+        captured.fail(new HttpFailure(elapsed >= config.storeTimeoutMs ? "store_unavailable" : "result_unknown"));
 
-        if (status < 200 || status >= 500) {
-          try {
-            await store.abort?.(key, fp, begin.reservationId);
-          } catch {
-            /* ignore */
-          }
-          return;
-        }
-      });
+        return;
+      }
 
-      res.setHeader("Idempotency-Status", "created");
-      res.setHeader("Idempotency-Replayed", "false");
-      return next();
-    } catch (err) {
-      return next(err);
+      if (!res.destroyed && !res.writableEnded) next();
+    } catch (error) {
+      const failure = error instanceof HttpFailure ? error : new HttpFailure("store_unavailable");
+
+      if (captured) captured.fail(new HttpFailure("result_unknown"));
+      else {
+        if (failure.unknown) emit({ type: "outcome-unknown", code: failure.code, status: failure.status });
+
+        sendFailure(res, failure, key);
+      }
     }
   };
-}
 
-function sendCached(res: Response, cached: CachedResponse, whitelist: string[]) {
-  const headers = filterHeaders(cached.headers, whitelist);
-  for (const [k, v] of Object.entries(headers)) {
-    res.setHeader(k, v as string | string[]);
+  function extractKey(req: Request): unknown {
+    if (config.getKey) {
+      try {
+        const value: unknown = config.getKey(req);
+
+        observeAsync(value);
+        if (value !== undefined && typeof value !== "string") throw new Error("Invalid extractor result");
+
+        return value;
+      } catch { throw new HttpFailure("extractor_failed"); }
+    }
+
+    let count = 0;
+
+    for (let i = 0; i < (req.rawHeaders?.length ?? 0); i += 2) {
+      if (req.rawHeaders[i].toLowerCase() === config.keyHeader) count++;
+    }
+
+    const value = req.headers[config.keyHeader];
+
+    if (count > 1 || (value !== undefined && typeof value !== "string")) throw new HttpFailure("key_invalid");
+
+    return value;
   }
-  res.status(cached.status);
-  if (cached.status === 204 || cached.status === 304) return res.end();
-  return res.end(cached.body);
 }
 
-function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms));
+function observeAsync(value: unknown): void {
+  if (value !== null && (typeof value === "object" || typeof value === "function")) {
+    void Promise.resolve(value).catch(() => undefined);
+  }
 }

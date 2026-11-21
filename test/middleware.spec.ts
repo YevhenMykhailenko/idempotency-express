@@ -3,9 +3,11 @@ import request from "supertest";
 import { describe, it, expect } from "vitest";
 
 import { idempotencyMiddleware, MemoryStore } from "../src/index.js";
+import { testHttpServer } from "./helpers/test-http-server.js";
 
 function makeApp() {
   const app = express();
+
   app.use(express.json());
   const store = new MemoryStore();
 
@@ -13,6 +15,8 @@ function makeApp() {
     "/orders",
     idempotencyMiddleware({
       store,
+      namespace: "middleware-tests",
+      scope: "public-test",
       replay: { headerWhitelist: ["location"] },
       inFlight: { strategy: "wait", waitTimeoutMs: 1000, pollMs: 50 }
     }),
@@ -22,24 +26,24 @@ function makeApp() {
     }
   );
 
-  return app;
+  return testHttpServer(app);
 }
 
 describe("middleware", () => {
   it("replays identical POST", async () => {
-    const app = makeApp();
+    const { server } = await makeApp();
 
     const key = "abc-123";
     const body = { a: 1 };
 
-    const r1 = await request(app)
+    const r1 = await request(server)
       .post("/orders")
       .set("Idempotency-Key", key)
       .send(body)
       .expect(201);
 
     expect(r1.headers["idempotency-status"]).toBe("created");
-    const r2 = await request(app)
+    const r2 = await request(server)
       .post("/orders")
       .set("Idempotency-Key", key)
       .send(body)
@@ -51,17 +55,17 @@ describe("middleware", () => {
   });
 
   it("conflicts on different payload with same key", async () => {
-    const app = makeApp();
+    const { server } = await makeApp();
 
     const key = "abc-456";
 
-    await request(app)
+    await request(server)
       .post("/orders")
       .set("Idempotency-Key", key)
       .send({ a: 1 })
       .expect(201);
 
-    const r2 = await request(app)
+    const r2 = await request(server)
       .post("/orders")
       .set("Idempotency-Key", key)
       .send({ a: 2 })

@@ -1,0 +1,121 @@
+{
+  "fixtureVersion": 1,
+  "recordedAt": "2026-11-13",
+  "packageVersion": "2.0.0",
+  "source": "src/utils/fingerprint.ts",
+  "sourceSha256": "e4b971c76eac80112902270ad401d5f1b58ee8fa2fb2040869f30b094e485513",
+  "fingerprintFormat": "express-idempotency-middleware:2",
+  "vectors": [
+    {
+      "id": "canonical-a",
+      "body": { "kind": "json", "raw": "{\"z\":1,\"a\":{\"y\":2,\"x\":3}}" },
+      "method": "POST",
+      "url": "/orders",
+      "expectedHash": "b1a6715415890c6ea95dc34913a6e73f2c8784a59176211c5edd33e234cdfa88"
+    },
+    {
+      "id": "canonical-b",
+      "body": { "kind": "json", "raw": "{\"a\":{\"x\":3,\"y\":2},\"z\":1}" },
+      "method": "POST",
+      "url": "/orders",
+      "expectedHash": "b1a6715415890c6ea95dc34913a6e73f2c8784a59176211c5edd33e234cdfa88"
+    },
+    {
+      "id": "string-spaces-a",
+      "body": { "kind": "json", "raw": "{\"note\":\"pay now\"}" },
+      "method": "POST",
+      "url": "/orders",
+      "expectedHash": "069315d61d837eccb8c076f79b4ed974e56c3fa837b9929fb6a8a92c69fe72cd"
+    },
+    {
+      "id": "string-spaces-b",
+      "body": { "kind": "json", "raw": "{\"note\":\"  pay now  \"}" },
+      "method": "POST",
+      "url": "/orders",
+      "expectedHash": "ebb06dafa68b22764998c52edccfd81a8ad15fee63c1e9ff323b4faed268da55"
+    },
+    {
+      "id": "buffer-ff",
+      "body": { "kind": "buffer", "hex": "ff" },
+      "method": "POST",
+      "url": "/orders",
+      "expectedHash": "9eaad2e7c879a9bafd1a39443d9d639000d72dd0148ed80a51ca98e55339f3db"
+    },
+    {
+      "id": "buffer-fe",
+      "body": { "kind": "buffer", "hex": "fe" },
+      "method": "POST",
+      "url": "/orders",
+      "expectedHash": "baa5ad1b00cac1d6c23c3c5713bde2ce2f24e9a02527a9f5f41807842f2718b5"
+    },
+    {
+      "id": "absent",
+      "body": { "kind": "absent" },
+      "method": "POST",
+      "url": "/orders",
+      "expectedHash": "82c6b1548b62175f98c76100694b48599d6724d7e35f96bb55d20869c8ebf2a5"
+    },
+    {
+      "id": "null",
+      "body": { "kind": "json", "raw": "null" },
+      "method": "POST",
+      "url": "/orders",
+      "expectedHash": "be87eb5f96885ddbf96ba6ca45a88c28b74f9b64a057c980b0a99f0c64ed9e86"
+    },
+    {
+      "id": "negative-zero",
+      "body": { "kind": "json", "raw": "-0" },
+      "method": "POST",
+      "url": "/orders",
+      "expectedHash": "904483a2c308a9db392c0111c992f2d501610b7c268ccd184adbc468f8a9eed4"
+    },
+    {
+      "id": "zero",
+      "body": { "kind": "json", "raw": "0" },
+      "method": "POST",
+      "url": "/orders",
+      "expectedHash": "9126c99bceeb12ee5113781461e20fe2f742a9a5e4454d9733fc71cdf371fc5a"
+    },
+    {
+      "id": "query-array",
+      "query": { "x": ["1", "2"] },
+      "options": { "includeQuery": true },
+      "body": { "kind": "json", "raw": "{}" },
+      "method": "POST",
+      "url": "/orders",
+      "expectedHash": "441a4a2a99e1c56454f11a3b7087a7f13f19c5ccff7b30e17721f0fa165636a2"
+    },
+    {
+      "id": "query-string",
+      "query": { "x": "1,2" },
+      "options": { "includeQuery": true },
+      "body": { "kind": "json", "raw": "{}" },
+      "method": "POST",
+      "url": "/orders",
+      "expectedHash": "541a60e24585dbecc8e090efeb042a22009c06bf4dc6b5e40a580bdf024954fc"
+    },
+    {
+      "id": "delimiter-absent-custom",
+      "body": { "kind": "text", "text": "A|{\"amount\":100}" },
+      "method": "POST",
+      "url": "/orders",
+      "expectedHash": "95be4242f171b331b373f0a7fd034f0189b5e02d9ecb0dd17e8919ec45546faa"
+    },
+    {
+      "id": "delimiter-custom-a",
+      "options": { "custom": "A" },
+      "body": { "kind": "text", "text": "{\"amount\":100}" },
+      "method": "POST",
+      "url": "/orders",
+      "expectedHash": "19df71f203b432e137aa7718ecb0c0e3755cc18a01fe447519315629c9956210"
+    },
+    {
+      "id": "custom-empty",
+      "options": { "custom": "" },
+      "body": { "kind": "absent" },
+      "method": "POST",
+      "url": "/orders",
+      "expectedHash": "c48bdb31988bf27fd9168fdac005eab4decb044bbb9f9e926f82e87feac281c1"
+    }
+  ]
+}
