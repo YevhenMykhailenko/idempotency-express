@@ -8,7 +8,7 @@ Include the package/Node/Express/Store versions, minimal private reproduction, r
 
 ## Version and platform scope
 
-This document describes the **3.0** API and its security boundaries. Local preparation and development test results do not establish that a fix is available in a published version or extend support commitments for older majors. Reports must identify the exact affected version. Maintainers must verify the private-reporting channel described above before publication.
+This document describes the **3.0** API and its security boundaries. Local preparation and development test results do not establish that a fix is available in a published version or extend support commitments for older majors. Reports must identify the exact affected version. Private vulnerability reporting is recommended as an optional reporting route, not a prerequisite for publishing this package; its availability is not asserted here.
 
 Node 18+ compatibility is retained by explicit project decision. Node 18 and 20 are upstream EOL (2025-04-30 and 2026-04-30 respectively; [official release schedule](https://github.com/nodejs/Release#release-schedule)); this library cannot supply missing Node security patches. Prefer a currently maintained Node release for production. Driver/framework vulnerabilities and their own runtime requirements also need independent assessment.
 
